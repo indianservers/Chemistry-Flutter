@@ -1,0 +1,17 @@
+{
+  "retrieved": "2026-10-25",
+  "files": {
+    "elements.json": {
+      "sha256": "361bc5b62b646dd9c4ec870e9b5b81fc2f46ebb7d06eb4324c788db5ab768c97",
+      "bytes": 340342
+    },
+    "molecules.json": {
+      "sha256": "79b6e74e57bc08ba59a27d3e841258e8b250ecfb3747a3e79bf07f4cb4899e60",
+      "bytes": 44448
+    },
+    "supplement.json": {
+      "sha256": "01d9bbabfd53b1e922712a73a0ddf6df87965f88c46e2ae6563b985cc4264f8e",
+      "bytes": 877693
+    }
+  }
+}

@@ -1,0 +1,5 @@
+package com.indianservers.chemistry_universe
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity : FlutterActivity()
