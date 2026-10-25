@@ -1,4 +1,7 @@
 import 'dart:math' as math;
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -8,11 +11,14 @@ import '../app/design.dart';
 import '../core/chemistry.dart';
 import '../core/store.dart';
 import '../rendering/molecule_view.dart';
+import 'periodic_style.dart';
+import '../shared/viewing_preferences.dart';
+part 'periodic_tools.dart';
 
 Color categoryColor(String category) => switch (category) {
   'alkali metal' => const Color(0xffff4563),
   'alkaline earth metal' => const Color(0xffffa42b),
-  'transition metal' => const Color(0xffe6bb36),
+  'transition metal' => const Color(0xff11d4c5),
   'post-transition metal' => const Color(0xff23ce95),
   'metalloid' => const Color(0xff13c8d5),
   'noble gas' => const Color(0xfff344a3),
@@ -42,16 +48,56 @@ class PeriodicScreen extends ConsumerStatefulWidget {
   ConsumerState<PeriodicScreen> createState() => _PeriodicState();
 }
 
-class _PeriodicState extends ConsumerState<PeriodicScreen> {
+class _PeriodicState extends ConsumerState<PeriodicScreen>
+    with SingleTickerProviderStateMixin {
   final transform = TransformationController();
+  late final StudioStore workspaceStore;
   final camera = CameraState();
   final search = TextEditingController();
   String? category, trend;
   int? group, period;
   final Set<int> compared = {6, 14};
   bool comparing = false;
+  bool gesturesLocked = false, showNames = true, panControls = false;
+  double inspectorFraction = .39;
+  Size viewport = Size.zero;
+  static const tableSize = Size(852, 566);
+  final Set<String> categoryFilters = {};
+  bool minimap = false,
+      semanticZoom = true,
+      dockTop = false,
+      compactDock = false;
+  int detailLevel = 1;
+  double heatIntensity = 1;
+  Timer? rememberTimer;
+  late final AnimationController viewAnimation;
+  Matrix4Tween? viewTween;
+  void _apply(VoidCallback fn) => setState(fn);
+  @override
+  void initState() {
+    super.initState();
+    workspaceStore = ref.read(studioProvider);
+    _restoreWorkspace();
+    transform.addListener(_viewChanged);
+    viewAnimation =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 220),
+        )..addListener(() {
+          if (viewTween != null) {
+            transform.value = viewTween!.transform(
+              Curves.easeOutCubic.transform(viewAnimation.value),
+            );
+          }
+        });
+  }
+
   @override
   void dispose() {
+    rememberTimer?.cancel();
+    _remember();
+    transform.removeListener(_viewChanged);
+    viewAnimation.dispose();
     transform.dispose();
     camera.dispose();
     search.dispose();
@@ -69,282 +115,247 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
     return key == null ? null : e.property(key);
   }
 
+  void _setView(double scale, Offset offset) {
+    transform.value = Matrix4.identity()
+      ..translateByDouble(offset.dx, offset.dy, 0, 1)
+      ..scaleByDouble(scale, scale, scale, 1);
+  }
+
+  void _zoom(double multiplier) {
+    final matrix = transform.value, old = matrix.getMaxScaleOnAxis();
+    final scale = (old * multiplier).clamp(.08, 4.0);
+    final focal = viewport.center(Offset.zero);
+    final scene = transform.toScene(focal);
+    _setView(scale, focal - scene * scale);
+  }
+
+  void _pan(Offset delta) {
+    final m = transform.value;
+    _setView(
+      m.getMaxScaleOnAxis(),
+      Offset(m.storage[12], m.storage[13]) + delta,
+    );
+  }
+
+  void _fit() {
+    if (viewport.isEmpty) {
+      return;
+    }
+    final scale = math
+        .min(
+          (viewport.width - 18) / tableSize.width,
+          (viewport.height - 64) / tableSize.height,
+        )
+        .clamp(.08, 4.0);
+    _setView(scale, Offset((viewport.width - tableSize.width * scale) / 2, 4));
+  }
+
+  void _focus(ElementData element) => _animateFocus(element);
   @override
   Widget build(BuildContext context) {
     final s = ref.watch(studioProvider);
     return ListenableBuilder(
-      listenable: s,
+      listenable: Listenable.merge([s, s.preferences]),
       builder: (context, _) {
         final selected = s.data.element(s.selectedElement);
         final categories = s.data.elements
             .map((e) => e.category)
             .toSet()
             .toList();
-        return Scaffold(
-          resizeToAvoidBottomInset: false,
-          body: SafeArea(
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 1200),
-                child: Column(
-                  children: [
-                    StudioHeader(
-                      'Periodic Table',
-                      'Explore elements, properties and trends',
-                      actions: [
-                        IconButton(
-                          tooltip: 'Search elements',
-                          icon: const Icon(Icons.search),
-                          onPressed: () => _search(s),
-                        ),
-                        PopupMenuButton<String>(
-                          onSelected: (v) {
-                            if (v == 'reset') {
-                              transform.value = Matrix4.identity();
-                            } else {
-                              _filters();
-                            }
-                          },
-                          itemBuilder: (_) => [
-                            const PopupMenuItem(
-                              value: 'reset',
-                              child: Text('Reset zoom'),
-                            ),
-                            const PopupMenuItem(
-                              value: 'filters',
-                              child: Text('Highlight group / period'),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                    SizedBox(
-                      height: 76,
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 14),
-                        child: Wrap(
-                          direction: Axis.vertical,
-                          spacing: 6,
-                          runSpacing: 6,
-                          children: [
-                            for (final c in categories)
-                              FilterChip(
-                                visualDensity: VisualDensity.compact,
-                                label: Text(
-                                  c,
-                                  style: const TextStyle(fontSize: 11),
-                                ),
-                                avatar: CircleAvatar(
-                                  backgroundColor: categoryColor(c),
-                                  radius: 5,
-                                ),
-                                selected: category == c,
-                                onSelected: (_) => setState(
-                                  () => category = category == c ? null : c,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    if (trend != null)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 14),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.gradient, color: cyan, size: 18),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                '$trend · dark → bright = low → high · gray = unavailable',
-                                style: const TextStyle(fontSize: 10),
-                              ),
-                            ),
-                            IconButton(
-                              onPressed: () => setState(() => trend = null),
-                              icon: const Icon(Icons.close, size: 18),
-                            ),
-                          ],
-                        ),
-                      ),
-                    if (comparing)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 14),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                'Tap 2–4 elements · ${compared.length} selected',
-                              ),
-                            ),
-                            TextButton(
-                              onPressed: compared.length < 2
-                                  ? null
-                                  : () => _compare(s),
-                              child: const Text('Compare'),
-                            ),
-                            IconButton(
-                              onPressed: () =>
-                                  setState(() => comparing = false),
-                              icon: const Icon(Icons.close),
-                            ),
-                          ],
-                        ),
-                      ),
-                    Expanded(
-                      flex: 5,
+        return CallbackShortcuts(
+          bindings: {
+            const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
+                _selectAdjacent(1),
+            const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
+                _selectAdjacent(-1),
+            const SingleActivator(LogicalKeyboardKey.equal): () => _zoom(1.25),
+            const SingleActivator(LogicalKeyboardKey.minus): () => _zoom(.8),
+            const SingleActivator(LogicalKeyboardKey.digit0): _fit,
+            const SingleActivator(LogicalKeyboardKey.keyR): () =>
+                transform.value = Matrix4.identity(),
+            const SingleActivator(LogicalKeyboardKey.keyF, control: true): () =>
+                _search(s),
+          },
+          child: Focus(
+            autofocus: true,
+            child: Scaffold(
+              resizeToAvoidBottomInset: false,
+              body: CustomPaint(
+                painter: ScienceBackdrop(),
+                child: SafeArea(
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 1100),
                       child: LayoutBuilder(
-                        builder: (context, box) => ClipRect(
-                          child: InteractiveViewer(
-                            transformationController: transform,
-                            constrained: false,
-                            minScale: .45,
-                            maxScale: 3,
-                            boundaryMargin: const EdgeInsets.all(20),
-                            child: GestureDetector(
-                              onDoubleTap: () {
-                                transform.value = Matrix4.identity()
-                                  ..scaleByDouble(1.5, 1.5, 1.5, 1);
-                              },
-                              child: SizedBox(
-                                width: math.max(850, box.maxWidth),
-                                height: 480,
-                                child: Stack(
-                                  children: [
-                                    for (var col = 1; col <= 18; col++)
-                                      Positioned(
-                                        left: 28 + (col - 1) * 44.5,
-                                        top: 0,
-                                        width: 40,
-                                        child: Text(
-                                          '$col',
-                                          textAlign: TextAlign.center,
-                                          style: TextStyle(
-                                            color: group == col ? cyan : muted,
-                                            fontSize: 11,
-                                          ),
-                                        ),
-                                      ),
-                                    for (var row = 1; row <= 7; row++)
-                                      Positioned(
-                                        left: 6,
-                                        top: 30 + (row - 1) * 44,
-                                        child: Text(
-                                          '$row',
-                                          style: const TextStyle(fontSize: 11),
-                                        ),
-                                      ),
-                                    const Positioned(
-                                      left: 5,
-                                      top: 390,
-                                      child: Text(
-                                        'Ln',
-                                        style: TextStyle(fontSize: 10),
-                                      ),
-                                    ),
-                                    const Positioned(
-                                      left: 5,
-                                      top: 434,
-                                      child: Text(
-                                        'An',
-                                        style: TextStyle(fontSize: 10),
-                                      ),
-                                    ),
-                                    for (final e in s.data.elements)
-                                      _tile(e, s),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                    Expanded(
-                      flex: 5,
-                      child: SingleChildScrollView(
-                        padding: const EdgeInsets.fromLTRB(14, 5, 14, 12),
-                        child: Panel(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
+                        builder: (context, screen) {
+                          final height = screen.maxHeight;
+                          return Column(
                             children: [
-                              Container(
-                                width: 38,
-                                height: 4,
-                                margin: const EdgeInsets.only(bottom: 12),
-                                decoration: BoxDecoration(
-                                  color: line,
-                                  borderRadius: BorderRadius.circular(8),
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  8,
+                                  12,
+                                  12,
                                 ),
-                              ),
-                              InkWell(
-                                onTap: () => _details(selected, s),
                                 child: Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
+                                    const AtomMark(size: 40),
+                                    const SizedBox(width: 13),
                                     Expanded(
-                                      flex: 2,
-                                      child: SizedBox(
-                                        height: 142,
-                                        child: Panel(
-                                          padding: EdgeInsets.zero,
-                                          child: MoleculeView(
-                                            molecule: s.data.presets.firstWhere(
-                                              (m) => m.name == 'Methane',
-                                            ),
-                                            camera: camera,
-                                            grid: false,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 18),
-                                    Expanded(
-                                      flex: 3,
                                       child: Column(
                                         crossAxisAlignment:
                                             CrossAxisAlignment.start,
                                         children: [
-                                          Text(
-                                            '${selected.number}',
-                                            style: const TextStyle(
-                                              fontSize: 16,
-                                            ),
-                                          ),
-                                          Text(
-                                            selected.symbol,
-                                            style: TextStyle(
-                                              fontSize: 45,
-                                              height: 1.1,
-                                              fontWeight: FontWeight.bold,
-                                              color: categoryColor(
-                                                selected.category,
+                                          FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            alignment: Alignment.centerLeft,
+                                            child: Text(
+                                              'Periodic Table',
+                                              style: TextStyle(
+                                                color: Colors.white,
+                                                fontSize: screen.maxWidth < 360
+                                                    ? 23
+                                                    : 27,
+                                                fontWeight: FontWeight.w700,
+                                                letterSpacing: -.6,
+                                                height: 1.05,
                                               ),
                                             ),
                                           ),
-                                          Text(
-                                            selected.name,
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 23,
-                                            ),
-                                          ),
-                                          Text(
-                                            '${selected.mass} u',
-                                            style: const TextStyle(
-                                              fontSize: 16,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 8),
-                                          Text(
-                                            selected.category,
-                                            style: TextStyle(
-                                              color: categoryColor(
-                                                selected.category,
+                                          const SizedBox(height: 3),
+                                          const FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            alignment: Alignment.centerLeft,
+                                            child: Text(
+                                              'Explore elements, properties and trends',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                color: muted,
+                                                fontSize: 11,
+                                                height: 1.2,
                                               ),
-                                              fontSize: 11,
                                             ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    _roundAction(
+                                      Icons.search,
+                                      'Search elements',
+                                      () => _search(s),
+                                    ),
+                                    const SizedBox(width: 7),
+                                    NeonSurface(
+                                      radius: 30,
+                                      padding: EdgeInsets.zero,
+                                      child: PopupMenuButton<String>(
+                                        tooltip: 'Table options',
+                                        icon: const Icon(
+                                          Icons.more_vert,
+                                          color: Colors.white,
+                                          size: 22,
+                                        ),
+                                        onSelected: (v) {
+                                          switch (v) {
+                                            case 'workspace':
+                                              _workspaceTools();
+                                            case 'favorites':
+                                              _shelf();
+                                            case 'preferences':
+                                              showViewingPreferences(
+                                                context,
+                                                s.preferences,
+                                              );
+                                            case 'coach':
+                                              message(
+                                                context,
+                                                'Explore the table',
+                                                'Drag to pan; pinch or double-tap to zoom. The minimap and view presets are in Table workspace. Tap group/period labels to highlight a sequence. Arrow keys move selection; +/− zoom, 0 fits, R resets, Ctrl+F searches.',
+                                              );
+                                            case 'reset':
+                                              transform.value =
+                                                  Matrix4.identity();
+                                            case 'fit':
+                                              _fit();
+                                            case 'filters':
+                                              _filters();
+                                            case 'trends':
+                                              _trends();
+                                            case 'compare':
+                                              setState(
+                                                () => comparing = !comparing,
+                                              );
+                                            case 'names':
+                                              setState(
+                                                () => showNames = !showNames,
+                                              );
+                                            case 'details':
+                                              _details(selected, s);
+                                            case 'isotopes':
+                                              _isotopes(selected);
+                                          }
+                                        },
+                                        itemBuilder: (_) => [
+                                          const PopupMenuItem(
+                                            value: "workspace",
+                                            child: Text("Table workspace"),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: "favorites",
+                                            child: Text(
+                                              "Favorites & recent elements",
+                                            ),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: "preferences",
+                                            child: Text(
+                                              "Viewing & accessibility",
+                                            ),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: "coach",
+                                            child: Text("Quick guide"),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'reset',
+                                            child: Text('Reset view'),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'fit',
+                                            child: Text('Fit all 118 elements'),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'filters',
+                                            child: Text(
+                                              'Highlight group / period',
+                                            ),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'trends',
+                                            child: Text('Periodic trends'),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'compare',
+                                            child: Text('Compare elements'),
+                                          ),
+                                          PopupMenuItem(
+                                            value: 'names',
+                                            child: Text(
+                                              showNames
+                                                  ? 'Hide element names'
+                                                  : 'Show element names',
+                                            ),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'isotopes',
+                                            child: Text('Isotope explorer'),
+                                          ),
+                                          const PopupMenuItem(
+                                            value: 'details',
+                                            child: Text('Element details'),
                                           ),
                                         ],
                                       ),
@@ -352,133 +363,544 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
                                   ],
                                 ),
                               ),
-                              const SizedBox(height: 10),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: PropertyRow(
-                                      'Group',
-                                      '${selected.data['group']}',
-                                    ),
+                              SizedBox(
+                                height: 43,
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  padding: const EdgeInsets.fromLTRB(
+                                    14,
+                                    2,
+                                    14,
+                                    5,
                                   ),
-                                  const SizedBox(width: 14),
-                                  Expanded(
-                                    child: PropertyRow(
-                                      'Period',
-                                      '${selected.data['period']}',
-                                    ),
+                                  child: Row(
+                                    children: [
+                                      for (final c in categories)
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            right: 7,
+                                          ),
+                                          child: Semantics(
+                                            selected: categoryFilters.contains(
+                                              c,
+                                            ),
+                                            button: true,
+                                            child: InkWell(
+                                              borderRadius:
+                                                  BorderRadius.circular(11),
+                                              onTap: () => _refresh(() {
+                                                categoryFilters.contains(c)
+                                                    ? categoryFilters.remove(c)
+                                                    : categoryFilters.add(c);
+                                              }),
+                                              child: NeonSurface(
+                                                selected: categoryFilters
+                                                    .contains(c),
+                                                radius: 11,
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal: 10,
+                                                      vertical: 7,
+                                                    ),
+                                                child: Row(
+                                                  children: [
+                                                    Container(
+                                                      width: 9,
+                                                      height: 9,
+                                                      decoration: BoxDecoration(
+                                                        shape: BoxShape.circle,
+                                                        color: categoryColor(c),
+                                                        boxShadow: [
+                                                          BoxShadow(
+                                                            color:
+                                                                categoryColor(c)
+                                                                    .withValues(
+                                                                      alpha: .5,
+                                                                    ),
+                                                            blurRadius: 7,
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    Text(
+                                                      '${s.preferences.patterns ? '${_categoryTag(c)} · ' : ''}$c (${s.data.elements.where((e) => e.category == c).length})',
+                                                      style: TextStyle(
+                                                        color:
+                                                            categoryFilters
+                                                                .contains(c)
+                                                            ? Colors.white
+                                                            : muted,
+                                                        fontSize: 11,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                    ],
                                   ),
-                                ],
+                                ),
                               ),
-                              PropertyRow(
-                                'Electron configuration',
-                                selected.configuration,
+                              if (trend != null)
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(
+                                        Icons.gradient,
+                                        color: cyan,
+                                        size: 16,
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Expanded(
+                                        child: Text(
+                                          '$trend · dark → bright = low → high · gray = unavailable',
+                                          style: const TextStyle(fontSize: 9),
+                                        ),
+                                      ),
+                                      IconButton(
+                                        visualDensity: VisualDensity.compact,
+                                        tooltip: 'Clear trend',
+                                        onPressed: () =>
+                                            setState(() => trend = null),
+                                        icon: const Icon(Icons.close, size: 16),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              if (trend != null)
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                  ),
+                                  child: _trendScale(s),
+                                ),
+                              if (comparing) _comparisonTray(),
+                              if (comparing)
+                                Row(
+                                  children: [
+                                    const SizedBox(width: 14),
+                                    Expanded(
+                                      child: Text(
+                                        'Tap 2–4 elements · ${compared.length} selected',
+                                        style: const TextStyle(fontSize: 11),
+                                      ),
+                                    ),
+                                    TextButton(
+                                      onPressed: compared.length < 2
+                                          ? null
+                                          : () => _compare(s),
+                                      child: const Text('Compare'),
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Close comparison',
+                                      onPressed: () =>
+                                          setState(() => comparing = false),
+                                      icon: const Icon(Icons.close, size: 18),
+                                    ),
+                                  ],
+                                ),
+                              Expanded(
+                                child: LayoutBuilder(
+                                  builder: (context, box) {
+                                    viewport = box.biggest;
+                                    return Stack(
+                                      children: [
+                                        Positioned.fill(
+                                          child: ClipRect(
+                                            child: InteractiveViewer(
+                                              key: const ValueKey(
+                                                'periodic-viewport',
+                                              ),
+                                              transformationController:
+                                                  transform,
+                                              constrained: false,
+                                              alignment: Alignment.topLeft,
+                                              minScale: .08,
+                                              maxScale: 4,
+                                              boundaryMargin:
+                                                  const EdgeInsets.all(900),
+                                              panEnabled: !gesturesLocked,
+                                              scaleEnabled: !gesturesLocked,
+                                              child: GestureDetector(
+                                                onDoubleTap: () => _zoom(1.5),
+                                                child: RepaintBoundary(
+                                                  child: SizedBox(
+                                                    width: tableSize.width,
+                                                    height: tableSize.height,
+                                                    child: Stack(
+                                                      children: [
+                                                        Positioned.fill(
+                                                          child: IgnorePointer(
+                                                            child: CustomPaint(
+                                                              painter:
+                                                                  _EmptyCellsPainter(
+                                                                    s
+                                                                        .data
+                                                                        .elements,
+                                                                  ),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        for (
+                                                          var col = 1;
+                                                          col <= 18;
+                                                          col++
+                                                        )
+                                                          Positioned(
+                                                            left:
+                                                                28 +
+                                                                (col - 1) *
+                                                                    45.0,
+                                                            top: 8,
+                                                            width: 42,
+                                                            child: GestureDetector(
+                                                              onTap: () =>
+                                                                  setState(
+                                                                    () => group =
+                                                                        group ==
+                                                                            col
+                                                                        ? null
+                                                                        : col,
+                                                                  ),
+                                                              child: Text(
+                                                                '$col',
+                                                                textAlign:
+                                                                    TextAlign
+                                                                        .center,
+                                                                style: TextStyle(
+                                                                  fontSize: 11,
+                                                                  color:
+                                                                      group ==
+                                                                          col
+                                                                      ? cyan
+                                                                      : muted,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w600,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        for (
+                                                          var row = 1;
+                                                          row <= 7;
+                                                          row++
+                                                        )
+                                                          Positioned(
+                                                            left: 6,
+                                                            top:
+                                                                45 +
+                                                                (row - 1) *
+                                                                    53.0,
+                                                            child: GestureDetector(
+                                                              onTap: () =>
+                                                                  setState(
+                                                                    () => period =
+                                                                        period ==
+                                                                            row
+                                                                        ? null
+                                                                        : row,
+                                                                  ),
+                                                              child: Text(
+                                                                '$row',
+                                                                style: TextStyle(
+                                                                  fontSize: 11,
+                                                                  color:
+                                                                      period ==
+                                                                          row
+                                                                      ? cyan
+                                                                      : muted,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        const Positioned(
+                                                          left: 3,
+                                                          top: 465,
+                                                          child: Text(
+                                                            'Ln',
+                                                            style: TextStyle(
+                                                              fontSize: 9,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        const Positioned(
+                                                          left: 3,
+                                                          top: 518,
+                                                          child: Text(
+                                                            'An',
+                                                            style: TextStyle(
+                                                              fontSize: 9,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        for (final e
+                                                            in s.data.elements)
+                                                          _tile(e, s),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        Positioned.fill(
+                                          child: IgnorePointer(
+                                            child: ListenableBuilder(
+                                              listenable: transform,
+                                              builder: (context, _) =>
+                                                  CustomPaint(
+                                                    painter:
+                                                        _StickyLabelsPainter(
+                                                          transform.value,
+                                                        ),
+                                                  ),
+                                            ),
+                                          ),
+                                        ),
+                                        if (minimap)
+                                          Positioned(
+                                            right: 12,
+                                            top: panControls ? 145 : 18,
+                                            child: _minimap(),
+                                          ),
+                                        if (s.preferences.periodicHints)
+                                          Positioned(
+                                            left: 12,
+                                            top: 24,
+                                            child: NeonSurface(
+                                              radius: 9,
+                                              padding: const EdgeInsets.only(
+                                                left: 8,
+                                              ),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  const Text(
+                                                    'Drag to explore · pinch to zoom',
+                                                    style: TextStyle(
+                                                      fontSize: 9,
+                                                    ),
+                                                  ),
+                                                  IconButton(
+                                                    tooltip: 'Dismiss table guidance',
+                                                    visualDensity:
+                                                        VisualDensity.compact,
+                                                    onPressed: () {
+                                                      s
+                                                              .preferences
+                                                              .periodicHints =
+                                                          false;
+                                                      s.preferences.persist();
+                                                    },
+                                                    icon: const Icon(
+                                                      Icons.close,
+                                                      size: 13,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        if (panControls)
+                                          Positioned(
+                                            right: 12,
+                                            top: 4,
+                                            child: NeonSurface(
+                                              radius: 14,
+                                              padding: const EdgeInsets.all(2),
+                                              child: Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  _viewButton(
+                                                    Icons.keyboard_arrow_up,
+                                                    'Move up',
+                                                    () => _pan(
+                                                      const Offset(0, -70),
+                                                    ),
+                                                  ),
+                                                  Row(
+                                                    mainAxisSize:
+                                                        MainAxisSize.min,
+                                                    children: [
+                                                      _viewButton(
+                                                        Icons
+                                                            .keyboard_arrow_left,
+                                                        'Move left',
+                                                        () => _pan(
+                                                          const Offset(-70, 0),
+                                                        ),
+                                                      ),
+                                                      _viewButton(
+                                                        Icons
+                                                            .keyboard_arrow_right,
+                                                        'Move right',
+                                                        () => _pan(
+                                                          const Offset(70, 0),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                  _viewButton(
+                                                    Icons.keyboard_arrow_down,
+                                                    'Move down',
+                                                    () => _pan(
+                                                      const Offset(0, 70),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        Positioned(
+                                          left: 12,
+                                          right: 12,
+                                          top: dockTop ? 4 : null,
+                                          bottom: dockTop ? null : 5,
+                                          child: Center(
+                                            child: NeonSurface(
+                                              radius: 13,
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 4,
+                                                    vertical: 2,
+                                                  ),
+                                              child: SingleChildScrollView(
+                                                scrollDirection:
+                                                    Axis.horizontal,
+                                                child: Row(
+                                                  mainAxisSize:
+                                                      MainAxisSize.min,
+                                                  children: [
+                                                    _viewButton(
+                                                      Icons.open_with,
+                                                      'Pan controls',
+                                                      () => setState(
+                                                        () => panControls =
+                                                            !panControls,
+                                                      ),
+                                                    ),
+                                                    _viewButton(
+                                                      Icons.remove,
+                                                      'Zoom out',
+                                                      () => _zoom(1 / 1.25),
+                                                    ),
+                                                    ListenableBuilder(
+                                                      listenable: transform,
+                                                      builder: (context, _) =>
+                                                          SizedBox(
+                                                            width: 36,
+                                                            child: Text(
+                                                              '${(transform.value.getMaxScaleOnAxis() * 100).round()}%',
+                                                              textAlign:
+                                                                  TextAlign
+                                                                      .center,
+                                                              style:
+                                                                  const TextStyle(
+                                                                    fontSize:
+                                                                        10,
+                                                                    color:
+                                                                        muted,
+                                                                  ),
+                                                            ),
+                                                          ),
+                                                    ),
+                                                    _viewButton(
+                                                      Icons.add,
+                                                      'Zoom in',
+                                                      () => _zoom(1.25),
+                                                    ),
+                                                    _viewButton(
+                                                      Icons.fit_screen,
+                                                      'Fit all elements',
+                                                      _fit,
+                                                    ),
+                                                    _viewButton(
+                                                      Icons.my_location,
+                                                      'Focus selected element',
+                                                      () => _focus(selected),
+                                                    ),
+                                                    _viewButton(
+                                                      gesturesLocked
+                                                          ? Icons.lock_outline
+                                                          : Icons.lock_open,
+                                                      'Lock or unlock gestures',
+                                                      () => setState(
+                                                        () => gesturesLocked =
+                                                            !gesturesLocked,
+                                                      ),
+                                                    ),
+                                                    _viewButton(
+                                                      Icons.restart_alt,
+                                                      'Reset table view',
+                                                      () => transform.value =
+                                                          Matrix4.identity(),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    );
+                                  },
+                                ),
                               ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: ToolButton(
-                                      Icons.view_in_ar,
-                                      '3D Atom',
-                                      () => _atom(selected),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: ToolButton(
-                                      Icons.blur_circular,
-                                      'Isotopes',
-                                      () => _isotopes(selected),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: ToolButton(
-                                      Icons.hub_outlined,
-                                      'Use atom',
-                                      () {
-                                        s.chooseAtom(selected.number);
-                                        context.go('/molecule');
-                                      },
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: ToolButton(
-                                      Icons.more_horiz,
-                                      'Details',
-                                      () => _details(selected, s),
-                                    ),
-                                  ),
-                                ],
+                              _elementInspector(
+                                selected,
+                                s,
+                                height,
+                                screen.maxWidth,
                               ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: _launch(
-                                      Icons.trending_up,
-                                      'Trends',
-                                      'Explore periodic trends',
-                                      _trends,
-                                    ),
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  12,
+                                  9,
+                                  12,
+                                  10,
+                                ),
+                                child: NeonSurface(
+                                  radius: 23,
+                                  padding: EdgeInsets.zero,
+                                  child: Row(
+                                    children: [
+                                      _navItem(
+                                        Icons.home_outlined,
+                                        'Home',
+                                        false,
+                                        () => context.go('/'),
+                                      ),
+                                      _navItem(
+                                        Icons.grid_view_rounded,
+                                        'Periodic Table',
+                                        true,
+                                        () => transform.value =
+                                            Matrix4.identity(),
+                                      ),
+                                      _navItem(
+                                        Icons.hub_outlined,
+                                        'Molecule Studio',
+                                        false,
+                                        () => context.go('/molecule'),
+                                      ),
+                                    ],
                                   ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: _launch(
-                                      Icons.balance,
-                                      'Compare',
-                                      'Compare 2–4 elements',
-                                      () {
-                                        setState(() => comparing = !comparing);
-                                      },
-                                    ),
-                                  ),
-                                ],
+                                ),
                               ),
                             ],
-                          ),
-                        ),
+                          );
+                        },
                       ),
                     ),
-                    Container(
-                      decoration: const BoxDecoration(
-                        border: Border(top: BorderSide(color: line)),
-                      ),
-                      padding: const EdgeInsets.symmetric(
-                        vertical: 6,
-                        horizontal: 12,
-                      ),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceAround,
-                        children: [
-                          Expanded(
-                            child: ToolButton(
-                              Icons.home_outlined,
-                              'Home',
-                              () => context.go('/'),
-                            ),
-                          ),
-                          Expanded(
-                            child: ToolButton(
-                              Icons.grid_view_rounded,
-                              'Periodic Table',
-                              () => transform.value = Matrix4.identity(),
-                              active: true,
-                            ),
-                          ),
-                          Expanded(
-                            child: ToolButton(
-                              Icons.hub_outlined,
-                              'Molecule Studio',
-                              () => context.go('/molecule'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ),
             ),
@@ -488,9 +910,549 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
     );
   }
 
+  Widget _roundAction(IconData icon, String label, VoidCallback action) =>
+      NeonSurface(
+        radius: 30,
+        padding: EdgeInsets.zero,
+        child: IconButton(
+          tooltip: label,
+          onPressed: action,
+          icon: Icon(icon, color: Colors.white, size: 22),
+        ),
+      );
+  Widget _viewButton(IconData icon, String label, VoidCallback action) =>
+      compactDock &&
+          [
+            'Pan controls',
+            'Lock or unlock gestures',
+            'Reset table view',
+          ].contains(label)
+      ? const SizedBox.shrink()
+      : SizedBox(
+          width: ref.read(studioProvider).preferences.largeControls ? 40 : 34,
+          height: ref.read(studioProvider).preferences.largeControls ? 44 : 36,
+          child: IconButton(
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 30, minHeight: 32),
+            tooltip: label,
+            onPressed: action,
+            icon: Icon(icon, size: 17, color: muted),
+          ),
+        );
+  Widget _navItem(IconData icon, String label, bool active, VoidCallback tap) =>
+      Expanded(
+        child: InkWell(
+          onTap: tap,
+          borderRadius: BorderRadius.circular(23),
+          child: NeonSurface(
+            selected: active,
+            radius: 23,
+            padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 3),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  icon,
+                  size: 23,
+                  color: active ? cyan : muted,
+                  shadows: active
+                      ? const [Shadow(color: Color(0xff1c9dff), blurRadius: 12)]
+                      : null,
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: active ? cyan : muted,
+                    fontSize: 10,
+                    height: 1.1,
+                    fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+  Widget _elementInspector(
+    ElementData e,
+    StudioStore s,
+    double screenHeight,
+    double width,
+  ) {
+    final collapsed = inspectorFraction < .2;
+    final height = (screenHeight * inspectorFraction).clamp(
+      86.0,
+      math.max(100.0, screenHeight - 300),
+    );
+    return GestureDetector(
+      onHorizontalDragEnd: (d) =>
+          _selectAdjacent((d.primaryVelocity ?? 0) < 0 ? 1 : -1),
+      child: Container(
+        key: const ValueKey('element-inspector'),
+        height: height.toDouble(),
+        decoration: BoxDecoration(
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          border: Border.all(color: const Color(0xff275b91)),
+          gradient: const LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0xff102e51), Color(0xff03142a), Color(0xff031126)],
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xff0674e8).withValues(alpha: .14),
+              blurRadius: 24,
+              offset: const Offset(0, -6),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            SizedBox(
+              height: 30,
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: 'Previous element',
+                    padding: EdgeInsets.zero,
+                    onPressed: () => _selectAdjacent(-1),
+                    icon: const Icon(Icons.chevron_left, size: 19),
+                  ),
+                  Expanded(
+                    child: Text(
+                      'Swipe through ${group != null
+                          ? 'group $group'
+                          : period != null
+                          ? 'period $period'
+                          : 'elements'}',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 9),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Favorite element',
+                    padding: EdgeInsets.zero,
+                    onPressed: () => s.preferences.favoriteElement(e.number),
+                    icon: Icon(
+                      s.preferences.favoriteElements.contains(e.number)
+                          ? Icons.star
+                          : Icons.star_border,
+                      color: cyan,
+                      size: 18,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Next element',
+                    padding: EdgeInsets.zero,
+                    onPressed: () => _selectAdjacent(1),
+                    icon: const Icon(Icons.chevron_right, size: 19),
+                  ),
+                ],
+              ),
+            ),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () =>
+                  setState(() => inspectorFraction = collapsed ? .39 : .14),
+              onVerticalDragUpdate: (d) => setState(
+                () => inspectorFraction =
+                    (inspectorFraction - d.delta.dy / screenHeight).clamp(
+                      .14,
+                      .65,
+                    ),
+              ),
+              onVerticalDragEnd: (_) => _refresh(
+                () => inspectorFraction = [.14, .39, .62].reduce(
+                  (a, b) =>
+                      (a - inspectorFraction).abs() <
+                          (b - inspectorFraction).abs()
+                      ? a
+                      : b,
+                ),
+              ),
+              child: SizedBox(
+                height: 23,
+                width: double.infinity,
+                child: Center(
+                  child: Container(
+                    width: 36,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: const Color(0xff6097d0),
+                      borderRadius: BorderRadius.circular(5),
+                      boxShadow: [
+                        BoxShadow(
+                          color: cyan.withValues(alpha: .1),
+                          blurRadius: 10,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(14, 1, 14, 12),
+                child: NeonSurface(
+                  radius: 18,
+                  padding: const EdgeInsets.all(9),
+                  child: Column(
+                    children: [
+                      InkWell(
+                        onTap: () => _details(e, s),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              flex: 42,
+                              child: SizedBox(
+                                height: collapsed ? 45 : 124,
+                                child: NeonSurface(
+                                  radius: 14,
+                                  padding: EdgeInsets.zero,
+                                  child: Stack(
+                                    children: [
+                                      Positioned.fill(
+                                        child: e.number == 6
+                                            ? MoleculeView(
+                                                molecule: s.data.presets
+                                                    .firstWhere(
+                                                      (m) =>
+                                                          m.name == 'Methane',
+                                                    ),
+                                                camera: camera,
+                                                grid: false,
+                                              )
+                                            : CustomPaint(
+                                                painter: AtomPainter(
+                                                  e,
+                                                  .2,
+                                                  1,
+                                                  false,
+                                                  false,
+                                                ),
+                                              ),
+                                      ),
+                                      Positioned(
+                                        top: 6,
+                                        left: 6,
+                                        child: InkWell(
+                                          onTap: () => _atom(e),
+                                          child: NeonSurface(
+                                            radius: 8,
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 5,
+                                              vertical: 3,
+                                            ),
+                                            child: const Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Icon(
+                                                  Icons.view_in_ar_outlined,
+                                                  size: 12,
+                                                  color: Colors.white,
+                                                ),
+                                                SizedBox(width: 4),
+                                                Text(
+                                                  '3D',
+                                                  style: TextStyle(
+                                                    fontSize: 9,
+                                                    color: Colors.white,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      Positioned(
+                                        top: 0,
+                                        right: 0,
+                                        child: IconButton(
+                                          tooltip: 'Expand atom viewer',
+                                          visualDensity: VisualDensity.compact,
+                                          onPressed: () => _atom(e),
+                                          icon: const Icon(
+                                            Icons.open_in_full,
+                                            size: 12,
+                                            color: muted,
+                                          ),
+                                        ),
+                                      ),
+                                      if (!collapsed)
+                                        Positioned(
+                                          bottom: 7,
+                                          left: 0,
+                                          right: 0,
+                                          child: Row(
+                                            mainAxisAlignment:
+                                                MainAxisAlignment.center,
+                                            children: [
+                                              for (var i = 0; i < 4; i++)
+                                                Container(
+                                                  width: 5,
+                                                  height: 5,
+                                                  margin:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 3,
+                                                      ),
+                                                  decoration: BoxDecoration(
+                                                    shape: BoxShape.circle,
+                                                    color: i == 0
+                                                        ? cyan
+                                                        : const Color(
+                                                            0xff315780,
+                                                          ),
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 15),
+                            Expanded(
+                              flex: 58,
+                              child: Stack(
+                                children: [
+                                  if (!collapsed)
+                                    Positioned(
+                                      right: 0,
+                                      top: 27,
+                                      child: IgnorePointer(
+                                        child: Opacity(
+                                          opacity: .7,
+                                          child: CustomPaint(
+                                            size: const Size(82, 82),
+                                            painter: ShellIllustration(
+                                              (e.data['shells'] as List)
+                                                  .cast<int>(),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Text(
+                                            '${e.number}',
+                                            style: const TextStyle(
+                                              fontSize: 14,
+                                              color: muted,
+                                            ),
+                                          ),
+                                          const Spacer(),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 7,
+                                              vertical: 4,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xff0c305c),
+                                              borderRadius:
+                                                  BorderRadius.circular(20),
+                                              border: Border.all(
+                                                color: const Color(0xff27578b),
+                                              ),
+                                            ),
+                                            child: Text(
+                                              _shortCategory(e.category),
+                                              style: TextStyle(
+                                                fontSize: 8,
+                                                color: categoryColor(
+                                                  e.category,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      Text(
+                                        e.symbol,
+                                        style: TextStyle(
+                                          fontSize: collapsed ? 28 : 37,
+                                          height: 1.08,
+                                          fontWeight: FontWeight.w700,
+                                          color: const Color(0xff3bbaff),
+                                          shadows: [
+                                            Shadow(
+                                              color: const Color(0xff068dff)
+                                                  .withValues(alpha: .6),
+                                              blurRadius: 15,
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      Text(
+                                        e.name,
+                                        style: const TextStyle(
+                                          fontSize: 19,
+                                          height: 1.12,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '${e.mass} u',
+                                        style: const TextStyle(
+                                          fontSize: 14,
+                                          color: muted,
+                                        ),
+                                      ),
+                                      if (!collapsed) ...[
+                                        const SizedBox(height: 8),
+                                        Text(
+                                          _elementCaption(e),
+                                          maxLines: 3,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontSize: 9,
+                                            height: 1.3,
+                                            color: muted,
+                                          ),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (!collapsed) ...[
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            for (final key
+                                in s.preferences.pinnedProperties.take(3))
+                              Expanded(
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 2,
+                                  ),
+                                  child: _pinCard(key, e),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 9),
+                        Wrap(
+                          spacing: 5,
+                          runSpacing: 4,
+                          children: [
+                            _inspectorAction(
+                              Icons.info_outline,
+                              'Details',
+                              () => _details(e, s),
+                            ),
+                            _inspectorAction(
+                              Icons.blur_circular,
+                              'Isotopes',
+                              () => _isotopes(e),
+                            ),
+                            _inspectorAction(
+                              Icons.trending_up,
+                              'Trends',
+                              _trends,
+                            ),
+                            _inspectorAction(Icons.balance, 'Compare', () {
+                              setState(() => comparing = !comparing);
+                            }),
+                            _inspectorAction(
+                              Icons.hub_outlined,
+                              'Use atom',
+                              () {
+                                _handoff(e, s);
+                              },
+                            ),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _fact(IconData icon, String label, String value) => NeonSurface(
+    radius: 9,
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+    child: Row(
+      children: [
+        Icon(icon, size: 21, color: const Color(0xff62b4ff)),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 7, color: muted),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 10,
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+  Widget _inspectorAction(IconData icon, String label, VoidCallback tap) =>
+      TextButton.icon(
+        style: TextButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          minimumSize: const Size(45, 32),
+          visualDensity: VisualDensity.compact,
+        ),
+        onPressed: tap,
+        icon: Icon(icon, size: 13),
+        label: Text(label, style: const TextStyle(fontSize: 9)),
+      );
+  String _shortCategory(String c) => switch (c) {
+    'diatomic nonmetal' || 'polyatomic nonmetal' => 'Nonmetal',
+    'alkaline earth metal' => 'Alkaline earth',
+    _ => c[0].toUpperCase() + c.substring(1),
+  };
+  String _elementCaption(ElementData e) => e.number == 6
+      ? 'Carbon forms the backbone of organic compounds and is essential to life.'
+      : '${e.name} · ${e.data['phase']} at standard conditions. Explore its electron configuration, isotopes and periodic properties.';
+  String _superscript(String configuration) => configuration.replaceAllMapped(
+    RegExp(r'([spdf])(\d+)'),
+    (m) =>
+        '${m[1]}${m[2]!.split('').map((d) => '⁰¹²³⁴⁵⁶⁷⁸⁹'[int.parse(d)]).join()}',
+  );
   Widget _tile(ElementData e, StudioStore s) {
     final match =
-        (category == null || e.category == category) &&
+        (categoryFilters.isEmpty || categoryFilters.contains(e.category)) &&
         (group == null || e.data['group'] == group) &&
         (period == null || e.data['period'] == period);
     var color = categoryColor(e.category);
@@ -504,7 +1466,7 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
         color = Color.lerp(
           const Color(0xff163451),
           cyan,
-          max == min ? 0.5 : ((v - min) / (max - min)),
+          max == min ? .5 : (v - min) / (max - min),
         )!;
       }
     }
@@ -512,66 +1474,153 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
         e.number == s.selectedElement ||
         (comparing && compared.contains(e.number));
     return Positioned(
-      left: 28 + (e.column - 1) * 44.5,
-      top: 26 + (e.row - 1) * 44,
-      width: 41,
-      height: 41,
+      left: 28 + (e.column - 1) * 45.0,
+      top: 29 + (e.row - 1) * 53.0,
+      width: 42,
+      height: 49,
       child: Opacity(
-        opacity: match ? 1 : .18,
+        opacity: match ? (trend == null ? 1 : heatIntensity) : .16,
         child: Tooltip(
           message:
               '${e.number} · ${e.name}${trend == null ? '' : ' · ${value(e)?.toStringAsPrecision(4) ?? 'Unavailable'}'}',
-          child: InkWell(
-            onTap: () {
-              if (comparing) {
-                setState(() {
-                  if (compared.contains(e.number)) {
-                    compared.remove(e.number);
-                  } else if (compared.length < 4) {
-                    compared.add(e.number);
-                  }
-                });
-                return;
-              }
-              if (s.selectedElement == e.number) {
-                _details(e, s);
-              } else {
-                s.selectElement(e.number);
-              }
-            },
-            child: Container(
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: active ? 0.4 : .13),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: active ? cyan : color,
-                  width: active ? 2 : 1,
-                ),
-                boxShadow: active
-                    ? [
-                        BoxShadow(
-                          color: cyan.withValues(alpha: .4),
-                          blurRadius: 10,
-                        ),
-                      ]
-                    : null,
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    '${e.number}',
-                    style: TextStyle(fontSize: 8, color: color),
+          child: Semantics(
+            label:
+                '${e.name}, atomic number ${e.number}, ${e.category}, atomic mass ${e.mass} unified atomic mass units',
+            selected: active,
+            button: true,
+            child: InkWell(
+              onTap: () {
+                if (comparing) {
+                  setState(() {
+                    if (compared.contains(e.number)) {
+                      compared.remove(e.number);
+                    } else if (compared.length < 4) {
+                      compared.add(e.number);
+                    }
+                  });
+                  return;
+                }
+                if (s.selectedElement == e.number) {
+                  _details(e, s);
+                } else {
+                  s.selectElement(e.number);
+                }
+              },
+              borderRadius: BorderRadius.circular(6),
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(6),
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      color.withValues(
+                        alpha: .34 * (trend == null ? 1 : heatIntensity),
+                      ),
+                      const Color(0xff031023),
+                      color.withValues(alpha: .13),
+                    ],
                   ),
-                  Text(
-                    e.symbol,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
+                  border: Border.all(
+                    color: active ? const Color(0xff72e5ff) : color,
+                    width: active ? 1.7 : 1,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: (active ? cyan : color).withValues(
+                        alpha: (active ? .48 : .12) * s.preferences.glow,
+                      ),
+                      blurRadius: active ? 12 : 5,
                     ),
+                  ],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(5),
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: ElementOrb(color: color, seed: e.number),
+                        ),
+                      ),
+                      Positioned(
+                        left: 4,
+                        top: 3,
+                        child: Text(
+                          '${e.number}',
+                          style: TextStyle(
+                            color: Color.lerp(color, Colors.white, .45),
+                            fontSize: 8,
+                          ),
+                        ),
+                      ),
+                      Center(
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                            top:
+                                (showNames &&
+                                    (!semanticZoom || detailLevel > 0))
+                                ? 1
+                                : 6,
+                          ),
+                          child: Text(
+                            e.symbol,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              shadows: [
+                                Shadow(color: Colors.black, blurRadius: 3),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (s.preferences.patterns)
+                        Positioned(
+                          right: 3,
+                          top: 3,
+                          child: Text(
+                            _categoryTag(e.category),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 6.5,
+                            ),
+                          ),
+                        ),
+                      if (semanticZoom && detailLevel == 2)
+                        Positioned(
+                          left: 1,
+                          right: 1,
+                          bottom: 2,
+                          child: Text(
+                            '${e.mass} u',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 5.5,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      if (showNames && (!semanticZoom || detailLevel > 0))
+                        Positioned(
+                          left: 1,
+                          right: 1,
+                          bottom: semanticZoom && detailLevel == 2 ? 12 : 4,
+                          child: Text(
+                            e.name,
+                            maxLines: 1,
+                            textAlign: TextAlign.center,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 6.8,
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
-                ],
+                ),
               ),
             ),
           ),
@@ -580,33 +1629,6 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
     );
   }
 
-  Widget _launch(
-    IconData icon,
-    String title,
-    String subtitle,
-    VoidCallback tap,
-  ) => InkWell(
-    onTap: tap,
-    child: Panel(
-      padding: const EdgeInsets.all(10),
-      child: Row(
-        children: [
-          Icon(icon, color: cyan),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: const TextStyle(color: Colors.white)),
-                Text(subtitle, style: const TextStyle(fontSize: 10)),
-              ],
-            ),
-          ),
-          const Icon(Icons.chevron_right, size: 17),
-        ],
-      ),
-    ),
-  );
   Future<void> _search(StudioStore s) async {
     search.clear();
     await showModalBottomSheet<void>(
@@ -629,6 +1651,21 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
                     ),
                     onChanged: (_) => update(() {}),
                   ),
+                  if (search.text.isEmpty)
+                    Wrap(
+                      spacing: 6,
+                      children: [
+                        for (final n in s.preferences.recentElements)
+                          ActionChip(
+                            label: Text(s.data.element(n).symbol),
+                            onPressed: () {
+                              s.selectElement(n);
+                              Navigator.pop(context);
+                              _focus(s.data.element(n));
+                            },
+                          ),
+                      ],
+                    ),
                   Expanded(
                     child: ListView(
                       children: [
@@ -638,18 +1675,41 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
                               .contains(search.text.toLowerCase()),
                         ))
                           ListTile(
-                            leading: Text(
-                              e.symbol,
-                              style: TextStyle(
-                                color: categoryColor(e.category),
-                                fontSize: 22,
+                            leading: SizedBox(
+                              width: 44,
+                              height: 44,
+                              child: NeonSurface(
+                                padding: const EdgeInsets.all(3),
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Text(
+                                      '${e.number}',
+                                      style: const TextStyle(
+                                        fontSize: 7,
+                                        height: 1,
+                                      ),
+                                    ),
+                                    Text(
+                                      e.symbol,
+                                      style: TextStyle(
+                                        color: categoryColor(e.category),
+                                        fontSize: 16,
+                                        height: 1.1,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                             title: Text(e.name),
-                            subtitle: Text('${e.number} · ${e.category}'),
+                            subtitle: Text(
+                              '${e.number} · ${e.mass} u · ${e.category}',
+                            ),
                             onTap: () {
                               s.selectElement(e.number);
                               Navigator.pop(context);
+                              _focus(e);
                             },
                           ),
                       ],
@@ -677,6 +1737,33 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
           controller: scroll,
           padding: const EdgeInsets.all(22),
           children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '${e.symbol}  ${e.name}',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Favorite element',
+                  onPressed: () => s.preferences.favoriteElement(e.number),
+                  icon: Icon(
+                    s.preferences.favoriteElements.contains(e.number)
+                        ? Icons.star
+                        : Icons.star_border,
+                    color: cyan,
+                  ),
+                ),
+              ],
+            ),
+            const Chip(
+              avatar: Icon(Icons.info_outline, size: 14),
+              label: Text(
+                'Reference · uncertainty unspecified',
+                style: TextStyle(fontSize: 10),
+              ),
+            ),
             Text(
               '${e.symbol}  ${e.name}',
               style: Theme.of(context).textTheme.titleLarge,
@@ -707,11 +1794,39 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
               ('density_g_cm3', 'Density', 'g/cm³'),
               ('electron_affinity', 'Electron affinity', 'kJ/mol'),
             ])
-              PropertyRow(
-                pair.$2,
-                e.property(pair.$1) == null
-                    ? 'Unavailable'
-                    : '${e.property(pair.$1)} ${pair.$3}',
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  PropertyRow(
+                    pair.$2,
+                    e.property(pair.$1) == null
+                        ? 'Unavailable'
+                        : '${e.property(pair.$1)} ${pair.$3}',
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 3, bottom: 6),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 7,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: panel,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: line),
+                      ),
+                      child: Text(
+                        e.valueQuality(pair.$1),
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: e.valueQuality(pair.$1) == 'Estimated'
+                              ? Colors.amber
+                              : muted,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             PropertyRow(
               'First ionization energy',
@@ -731,9 +1846,8 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
             const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: () {
-                s.chooseAtom(e.number);
                 Navigator.pop(context);
-                this.context.go('/molecule');
+                _handoff(e, s);
               },
               icon: const Icon(Icons.hub),
               label: const Text('Use in Molecule Studio'),
@@ -947,6 +2061,7 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
                     group = null;
                     period = null;
                     category = null;
+                    categoryFilters.clear();
                   });
                   Navigator.pop(context);
                 },
@@ -978,6 +2093,31 @@ class _PeriodicState extends ConsumerState<PeriodicScreen> {
                 const Text(
                   'Mendeleev dataset · abundance in % · tap to model nucleus',
                   style: TextStyle(fontSize: 10),
+                ),
+                SizedBox(
+                  height: 48,
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    children: [
+                      for (final iso in records)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: ActionChip(
+                            avatar: Icon(
+                              iso['is_radioactive'] == 0
+                                  ? Icons.check_circle_outline
+                                  : Icons.timelapse,
+                              size: 14,
+                            ),
+                            label: Text('${iso['mass_number']}'),
+                            onPressed: () {
+                              Navigator.pop(context);
+                              _atom(e, mass: iso['mass_number'] as int);
+                            },
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
                 Expanded(
                   child: ListView(
@@ -1200,4 +2340,34 @@ class AtomPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant AtomPainter oldDelegate) => true;
+}
+
+class _EmptyCellsPainter extends CustomPainter {
+  final List<ElementData> elements;
+  _EmptyCellsPainter(this.elements);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final occupied = elements.map((e) => '${e.column}:${e.row}').toSet();
+    final paint = Paint()
+      ..color = const Color(0xff13406a).withValues(alpha: .35)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = .4;
+    for (var row = 1; row <= 7; row++) {
+      for (var col = 1; col <= 18; col++) {
+        if (occupied.contains('$col:$row')) {
+          continue;
+        }
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(28 + (col - 1) * 45.0, 29 + (row - 1) * 53.0, 42, 49),
+            const Radius.circular(6),
+          ),
+          paint,
+        );
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _EmptyCellsPainter oldDelegate) => false;
 }

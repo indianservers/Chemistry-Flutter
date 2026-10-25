@@ -29,6 +29,7 @@ void main() {
     SharedPreferencesAsyncPlatform.instance =
         InMemorySharedPreferencesAsync.empty();
     final s = StudioStore(data, SharedPreferencesAsync());
+    addTearDown(s.dispose);
     await tester.pumpWidget(
       ProviderScope(
         overrides: [studioProvider.overrideWithValue(s)],
@@ -96,10 +97,77 @@ void main() {
       expect(rect.right, lessThanOrEqualTo(bounds.right));
     }
   });
+  testWidgets(
+    'table controls zoom, pan, fit, focus, lock and reset real viewport state',
+    (tester) async {
+      await mount(tester, const PeriodicScreen(), const Size(390, 844));
+      InteractiveViewer viewer() => tester.widget<InteractiveViewer>(
+        find.byKey(const ValueKey('periodic-viewport')),
+      );
+      final controller = viewer().transformationController!;
+      expect(controller.value.getMaxScaleOnAxis(), 1);
+      await tester.tap(find.byTooltip('Zoom in'));
+      await tester.pump();
+      expect(controller.value.getMaxScaleOnAxis(), closeTo(1.25, .001));
+      await tester.tap(find.byTooltip('Zoom out'));
+      await tester.pump();
+      expect(controller.value.getMaxScaleOnAxis(), closeTo(1, .001));
+      await tester.tap(find.byTooltip('Pan controls'));
+      await tester.pump();
+      final initial = controller.value.storage[12];
+      await tester.tap(find.byTooltip('Move right'));
+      await tester.pump();
+      expect(controller.value.storage[12], closeTo(initial + 70, .001));
+      await tester.tap(find.byTooltip('Fit all elements'));
+      await tester.pump();
+      expect(controller.value.getMaxScaleOnAxis(), lessThan(1));
+      final content = find
+          .descendant(
+            of: find.byKey(const ValueKey('periodic-viewport')),
+            matching: find.byType(Stack),
+          )
+          .first;
+      final viewportBounds = tester.getRect(
+        find.byKey(const ValueKey('periodic-viewport')),
+      );
+      expect(
+        tester.getRect(content).bottom,
+        lessThanOrEqualTo(viewportBounds.bottom - 58),
+      );
+      await tester.tap(find.byTooltip('Focus selected element'));
+      await tester.pumpAndSettle();
+      expect(controller.value.getMaxScaleOnAxis(), greaterThanOrEqualTo(.9));
+      await tester.tap(find.byTooltip('Lock or unlock gestures'));
+      await tester.pump();
+      expect(viewer().panEnabled, isFalse);
+      expect(viewer().scaleEnabled, isFalse);
+      await tester.tap(find.byTooltip('Reset table view'));
+      await tester.pump();
+      expect(controller.value.getMaxScaleOnAxis(), 1);
+      expect(controller.value.storage[12], 0);
+      expect(controller.value.storage[13], 0);
+    },
+  );
+  testWidgets('dragging the periodic table changes its position', (
+    tester,
+  ) async {
+    await mount(tester, const PeriodicScreen(), const Size(390, 844));
+    final widget = find.byKey(const ValueKey('periodic-viewport'));
+    final controller = tester
+        .widget<InteractiveViewer>(widget)
+        .transformationController!;
+    await tester.drag(widget, const Offset(-85, -50));
+    await tester.pumpAndSettle();
+    expect(controller.value.storage[12], lessThan(0));
+    expect(controller.value.storage[13], lessThan(0));
+  });
   testWidgets('Add atom and undo update molecule and mass', (tester) async {
     final s = await mount(tester, const MoleculeScreen(), const Size(390, 844));
     final count = s.molecule.atoms.length;
     await tester.tap(find.text('Add Atom'));
+    await tester.pump();
+    expect(s.molecule.atoms.length, count);
+    await tester.tap(find.byTooltip('Confirm placement'));
     await tester.pump();
     expect(s.molecule.atoms.length, count + 1);
     await tester.tap(find.byTooltip('Undo'));
@@ -108,6 +176,7 @@ void main() {
     await tester.tap(find.byTooltip('Redo'));
     await tester.pump();
     expect(s.molecule.atoms.length, count + 1);
+    await tester.pump(const Duration(milliseconds: 400));
   });
   testWidgets('Home launches periodic studio', (tester) async {
     tester.view.physicalSize = const Size(390, 844);
@@ -115,6 +184,7 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
     final s = StudioStore(data, SharedPreferencesAsync());
+    addTearDown(s.dispose);
     router.go('/');
     await tester.pumpWidget(
       ProviderScope(

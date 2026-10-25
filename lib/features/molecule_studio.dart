@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -11,6 +12,12 @@ import '../app/design.dart';
 import '../core/chemistry.dart';
 import '../core/store.dart';
 import '../rendering/molecule_view.dart';
+import '../shared/viewing_preferences.dart';
+import '../shared/orientation_cube.dart';
+import '../shared/text_prompt.dart';
+import 'molecule_library.dart';
+import 'molecule_import.dart';
+part 'molecule_tools.dart';
 
 class MoleculeScreen extends ConsumerStatefulWidget {
   const MoleculeScreen({super.key});
@@ -18,14 +25,69 @@ class MoleculeScreen extends ConsumerStatefulWidget {
   ConsumerState<MoleculeScreen> createState() => _MoleculeState();
 }
 
-class _MoleculeState extends ConsumerState<MoleculeScreen> {
+class _MoleculeState extends ConsumerState<MoleculeScreen>
+    with SingleTickerProviderStateMixin {
   final camera = CameraState();
+  late final StudioStore workspaceStore;
   int toolbar = 0, inspector = 0;
   bool expanded = false, labels = false, vibration = false, connecting = false;
+  bool vibrationVisible = false;
   double amplitude = .1, speed = 1;
   DisplayMode mode = DisplayMode.ballAndStick;
+  InteractionMode interaction = InteractionMode.rotate;
+  Atom? ghost;
+  Bond? pendingBond, selectedBond;
+  Molecule? movingPreview;
+  String moveAxis = 'Free',
+      measurementKind = 'Length',
+      vibrationKind = 'Alternating';
+  int inspectorSnap = 1;
+  final List<int> measureSelection = [];
+  final List<SceneMeasurement> pinnedMeasurements = [];
+  Size canvasSize = Size.zero;
+  late final AnimationController cameraAnimation;
+  Vector3? cameraFrom, cameraTo;
+  void _apply(VoidCallback fn) => setState(fn);
+  @override
+  void initState() {
+    super.initState();
+    workspaceStore = ref.read(studioProvider);
+    final state = ref.read(studioProvider).preferences.molecule;
+    try {
+      if (state['camera'] is Map) {
+        camera.restore((state['camera'] as Map).cast<String, dynamic>());
+      }
+      mode = DisplayMode.values[(state['mode'] as int? ?? 0).clamp(0, 3)];
+      inspectorSnap = (state['inspector'] as int? ?? 1).clamp(0, 2);
+      labels = state['labels'] == true;
+    } catch (_) {}
+
+    cameraAnimation =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 230),
+        )..addListener(() {
+          if (cameraFrom != null && cameraTo != null) {
+            final t = Curves.easeOutCubic.transform(cameraAnimation.value);
+            camera.focus = cameraFrom! + (cameraTo! - cameraFrom!) * t;
+            camera.pan = Offset.zero;
+            camera.zoom = 1 + t * .5;
+            camera.update();
+          }
+        });
+  }
+
   @override
   void dispose() {
+    final prefs = workspaceStore.preferences;
+    prefs.molecule = {
+      'camera': camera.toJson(),
+      'mode': mode.index,
+      'inspector': inspectorSnap,
+      'labels': labels,
+    };
+    prefs.persist(notify: false);
+    cameraAnimation.dispose();
     camera.dispose();
     super.dispose();
   }
@@ -34,7 +96,7 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
   Widget build(BuildContext context) {
     final s = ref.watch(studioProvider);
     return ListenableBuilder(
-      listenable: s,
+      listenable: Listenable.merge([s, s.preferences]),
       builder: (context, _) => Scaffold(
         resizeToAvoidBottomInset: false,
         body: SafeArea(
@@ -104,6 +166,12 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                               ('import', 'Import JSON'),
                               ('labels', 'Toggle atom labels'),
                               ('mode', 'Change display mode'),
+                              ('workspace', 'Molecule workspace'),
+                              ('history', 'Editing history'),
+                              ('palette', 'Full element picker'),
+                              ('bookmarks', 'Camera bookmarks'),
+                              ('legend', 'Visualization legend'),
+                              ('preferences', 'Viewing & accessibility'),
                             ])
                               PopupMenuItem(
                                 value: item.$1,
@@ -114,159 +182,246 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                       ],
                     ),
                   ),
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    height: 72,
-                    child: toolbar == 1
-                        ? _bondToolbar(s)
-                        : SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            padding: const EdgeInsets.symmetric(horizontal: 14),
-                            child: Row(
-                              children: [
-                                for (final n in [
-                                  6,
-                                  1,
-                                  8,
-                                  7,
-                                  17,
-                                  9,
-                                  15,
-                                  16,
-                                  35,
-                                  53,
-                                  ...([
-                                        6,
-                                        1,
-                                        8,
-                                        7,
-                                        17,
-                                        9,
-                                        15,
-                                        16,
-                                        35,
-                                        53,
-                                      ].contains(s.atomType)
-                                      ? <int>[]
-                                      : [s.atomType]),
-                                ])
-                                  Padding(
-                                    padding: const EdgeInsets.only(right: 8),
-                                    child: InkWell(
-                                      onTap: () => s.chooseAtom(n),
-                                      child: SizedBox(
-                                        width: 72,
-                                        child: Panel(
-                                          active: s.atomType == n,
-                                          padding: const EdgeInsets.all(4),
-                                          child: Column(
-                                            children: [
-                                              Container(
-                                                width: 22,
-                                                height: 22,
-                                                decoration: BoxDecoration(
-                                                  shape: BoxShape.circle,
-                                                  gradient: RadialGradient(
-                                                    center: const Alignment(
-                                                      -.4,
-                                                      -.5,
-                                                    ),
-                                                    colors: [
-                                                      Color.lerp(
+                  _modeToolbar(s),
+                  const SizedBox(height: 4),
+                  if (!(s.preferences.textScale > 1.1 &&
+                      interaction == InteractionMode.rotate))
+                    SizedBox(
+                      height: 72 * MediaQuery.textScalerOf(context).scale(1),
+                      child: toolbar == 1
+                          ? _bondToolbar(s)
+                          : SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                              ),
+                              child: Row(
+                                children: [
+                                  for (final n in [
+                                    6,
+                                    1,
+                                    8,
+                                    7,
+                                    17,
+                                    9,
+                                    15,
+                                    16,
+                                    35,
+                                    53,
+                                    ...([
+                                          6,
+                                          1,
+                                          8,
+                                          7,
+                                          17,
+                                          9,
+                                          15,
+                                          16,
+                                          35,
+                                          53,
+                                        ].contains(s.atomType)
+                                        ? <int>[]
+                                        : [s.atomType]),
+                                  ])
+                                    Padding(
+                                      padding: const EdgeInsets.only(right: 8),
+                                      child: InkWell(
+                                        onTap: () => s.chooseAtom(n),
+                                        child: SizedBox(
+                                          width: 72,
+                                          child: Panel(
+                                            active: s.atomType == n,
+                                            padding: const EdgeInsets.all(4),
+                                            child: Column(
+                                              children: [
+                                                Container(
+                                                  width: 22,
+                                                  height: 22,
+                                                  decoration: BoxDecoration(
+                                                    shape: BoxShape.circle,
+                                                    gradient: RadialGradient(
+                                                      center: const Alignment(
+                                                        -.4,
+                                                        -.5,
+                                                      ),
+                                                      colors: [
+                                                        Color.lerp(
+                                                          atomColor(n),
+                                                          Colors.white,
+                                                          .55,
+                                                        )!,
                                                         atomColor(n),
-                                                        Colors.white,
-                                                        .55,
-                                                      )!,
-                                                      atomColor(n),
-                                                      Colors.black,
-                                                    ],
+                                                        Colors.black,
+                                                      ],
+                                                    ),
                                                   ),
                                                 ),
-                                              ),
-                                              const SizedBox(height: 4),
-                                              Text(
-                                                s.data.element(n).symbol,
-                                                style: const TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 15,
-                                                  fontWeight: FontWeight.bold,
+                                                const SizedBox(height: 4),
+                                                Text(
+                                                  s.data.element(n).symbol,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 15,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
                                                 ),
-                                              ),
-                                              Text(
-                                                s.data.element(n).name,
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: const TextStyle(
-                                                  fontSize: 9,
+                                                Text(
+                                                  s.data.element(n).name,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    fontSize: 9,
+                                                  ),
                                                 ),
-                                              ),
-                                            ],
+                                              ],
+                                            ),
                                           ),
                                         ),
                                       ),
                                     ),
-                                  ),
-                              ],
+                                ],
+                              ),
                             ),
-                          ),
-                  ),
+                    ),
                   Expanded(
                     child: Stack(
                       children: [
                         Positioned.fill(
                           child: RepaintBoundary(
-                            child: MoleculeView(
-                              molecule: s.molecule,
-                              atomLabels: {
-                                for (final a in s.molecule.atoms)
-                                  a.id: s.data.element(a.number).symbol,
-                              },
-                              camera: camera,
-                              selected: s.selectedAtom,
-                              mode: mode,
-                              labels: labels,
-                              vibration: vibration,
-                              amplitude: amplitude,
-                              speed: speed,
-                              onPick: (id) {
-                                if (connecting &&
-                                    s.selectedAtom != null &&
-                                    id != null) {
-                                  if (s.selectedAtom == id) {
-                                    s.selectAtom(null);
-                                    return;
-                                  }
-                                  s.connect(s.selectedAtom!, id);
-                                  setState(() => connecting = false);
-                                } else {
-                                  s.selectAtom(id);
-                                }
-                              },
-                              onBond: (b) => _bondDetails(s, b),
+                            child: AnimatedSwitcher(
+                              duration: s.preferences.reducedMotion
+                                  ? Duration.zero
+                                  : const Duration(milliseconds: 180),
+                              child: MoleculeView(
+                                key: ValueKey(mode),
+                                molecule: movingPreview ?? s.molecule,
+                                interaction: interaction,
+                                ghost: ghost,
+                                previewBond: pendingBond,
+                                selectedBond: selectedBond,
+                                highlights: measureSelection.toSet(),
+                                warnings: validate(s.molecule)
+                                    .map(
+                                      (w) =>
+                                          RegExp(r'Atom (\d+)').firstMatch(w),
+                                    )
+                                    .whereType<RegExpMatch>()
+                                    .map((m) => int.parse(m[1]!))
+                                    .toSet(),
+                                measurements: pinnedMeasurements,
+                                alternativeColors:
+                                    s.preferences.alternativeColors,
+                                onMove: _moveAtom,
+                                onMoveEnd: _commitMove,
+                                onContext: _contextAtom,
+                                onPlace: (p) => _apply(
+                                  () => ghost = Atom(
+                                    -1,
+                                    s.atomType,
+                                    p.x,
+                                    p.y,
+                                    p.z,
+                                  ),
+                                ),
+                                onViewport: (size) => canvasSize = size,
+                                atomLabels: {
+                                  for (final a in s.molecule.atoms)
+                                    a.id: s.data.element(a.number).symbol,
+                                },
+                                camera: camera,
+                                selected: s.selectedAtom,
+                                mode: mode,
+                                labels:
+                                    labels || s.preferences.alternativeColors,
+                                vibration:
+                                    vibration && !s.preferences.reducedMotion,
+                                vibrationKind: vibrationKind,
+                                vibrationVisible: vibrationVisible,
+                                onInteractionStart: cameraAnimation.stop,
+                                amplitude: amplitude,
+                                speed: speed,
+                                onPick: _pickAtom,
+                                onBond: (bond) {
+                                  _apply(() => selectedBond = bond);
+                                  s.selectAtom(null);
+                                },
+                              ),
                             ),
                           ),
                         ),
                         Positioned(
-                          top: 12,
-                          left: 18,
-                          child: Text(
-                            connecting
-                                ? 'Select two atoms to connect'
-                                : s.selectedAtom == null
-                                ? 'Drag to rotate · Pinch to zoom'
-                                : '${s.data.element(s.molecule.atom(s.selectedAtom!).number).name} · Atom ${s.selectedAtom}',
-                            style: const TextStyle(fontSize: 11, color: muted),
-                          ),
+                          top: 6,
+                          left: 12,
+                          right: 12,
+                          child: _selectionBanner(s),
                         ),
                         Positioned(
+                          left: 12,
+                          bottom: 50,
+                          child: _orientationCube(),
+                        ),
+                        if (s.preferences.moleculeHints)
+                          Positioned(
+                            left: 70,
+                            bottom: 52,
+                            right: 65,
+                            child: Panel(
+                              padding: const EdgeInsets.all(6),
+                              child: Row(
+                                children: [
+                                  const Expanded(
+                                    child: Text(
+                                      'Pick a mode. Long-press atoms for actions.',
+                                      style: TextStyle(fontSize: 9),
+                                    ),
+                                  ),
+                                  IconButton(
+                                    tooltip: 'Dismiss molecule guidance',
+                                    visualDensity: VisualDensity.compact,
+                                    onPressed: () {
+                                      s.preferences.moleculeHints = false;
+                                      s.preferences.persist();
+                                    },
+                                    icon: const Icon(Icons.close, size: 12),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        if (interaction == InteractionMode.measure)
+                          Positioned(
+                            left: 70,
+                            bottom: 50,
+                            child: TextButton(
+                              onPressed: _workspaceTools,
+                              child: Text(
+                                measureSelection.length == measurementCount
+                                    ? 'Pin ${SceneMeasurement(measurementKind, measureSelection).value(s.molecule)}'
+                                    : '$measurementKind: ${measureSelection.length}/$measurementCount selected',
+                              ),
+                            ),
+                          ),
+                        if (selectedBond != null)
+                          Positioned(
+                            left: 70,
+                            bottom: 50,
+                            child: TextButton(
+                              onPressed: () => _bondDetails(s, selectedBond!),
+                              child: Text(
+                                'Bond ${selectedBond!.a}–${selectedBond!.b} · order ${selectedBond!.order}',
+                              ),
+                            ),
+                          ),
+                        Positioned(
                           right: 12,
-                          top: 30,
+                          top: 70,
                           bottom: 38,
                           child: SingleChildScrollView(
                             child: Column(
                               children: [
                                 _cameraTool(Icons.rotate_right, 'Rotate', () {
-                                  setState(() => connecting = false);
+                                  _setMode(InteractionMode.rotate);
                                 }),
                                 _cameraTool(Icons.add, 'Zoom in', () {
                                   camera.zoom = (camera.zoom * 1.2).clamp(
@@ -306,10 +461,13 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                                 onPressed: s.canRedo ? s.redo : null,
                                 icon: const Icon(Icons.redo),
                               ),
-                              if (vibration)
-                                const Text(
-                                  'Illustrative bond motion',
-                                  style: TextStyle(fontSize: 10, color: cyan),
+                              if (vibrationVisible)
+                                Text(
+                                  'Illustrative · ${vibration && !s.preferences.reducedMotion ? 'playing' : 'paused'}',
+                                  style: const TextStyle(
+                                    fontSize: 10,
+                                    color: cyan,
+                                  ),
                                 ),
                             ],
                           ),
@@ -317,131 +475,7 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                       ],
                     ),
                   ),
-                  GestureDetector(
-                    onVerticalDragEnd: (d) =>
-                        setState(() => expanded = (d.primaryVelocity ?? 0) < 0),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 220),
-                      height: expanded
-                          ? math.min(
-                              MediaQuery.sizeOf(context).height * .48,
-                              MediaQuery.sizeOf(context).height - 420,
-                            )
-                          : MediaQuery.sizeOf(context).height < 700
-                          ? 148
-                          : 218,
-                      decoration: const BoxDecoration(
-                        color: background,
-                        border: Border(top: BorderSide(color: line)),
-                        borderRadius: BorderRadius.vertical(
-                          top: Radius.circular(22),
-                        ),
-                      ),
-                      child: Column(
-                        children: [
-                          InkWell(
-                            onTap: () => setState(() => expanded = !expanded),
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(18, 8, 12, 6),
-                              child: Column(
-                                children: [
-                                  Container(
-                                    width: 38,
-                                    height: 4,
-                                    decoration: BoxDecoration(
-                                      color: line,
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Row(
-                                    children: [
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              s.molecule.name,
-                                              style: const TextStyle(
-                                                color: Colors.white,
-                                                fontSize: 25,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                            Text(
-                                              s.data.formula(s.molecule),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: const TextStyle(
-                                                fontSize: 18,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                      IconButton(
-                                        tooltip: 'Rename molecule',
-                                        onPressed: () => _rename(s),
-                                        icon: const Icon(Icons.edit_outlined),
-                                      ),
-                                      OutlinedButton.icon(
-                                        onPressed: () => _optimize(s),
-                                        icon: const Icon(
-                                          Icons.auto_awesome,
-                                          size: 18,
-                                        ),
-                                        label: const Text('Relax bonds'),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          SizedBox(
-                            height: 37,
-                            child: ListView(
-                              scrollDirection: Axis.horizontal,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                              ),
-                              children: [
-                                for (var i = 0; i < 4; i++)
-                                  Padding(
-                                    padding: const EdgeInsets.only(right: 6),
-                                    child: ChoiceChip(
-                                      label: Text(
-                                        [
-                                          'Properties',
-                                          'Geometry',
-                                          'Interactions',
-                                          'Lewis structure',
-                                        ][i],
-                                        style: const TextStyle(fontSize: 11),
-                                      ),
-                                      selected: inspector == i,
-                                      onSelected: (_) => setState(() {
-                                        inspector = i;
-                                        expanded = true;
-                                      }),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                          Expanded(
-                            child: SingleChildScrollView(
-                              padding: const EdgeInsets.fromLTRB(18, 4, 18, 14),
-                              child: _inspector(s),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+                  _inspectorPanel(s),
                   Container(
                     padding: const EdgeInsets.fromLTRB(12, 7, 12, 9),
                     decoration: const BoxDecoration(
@@ -454,17 +488,21 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                           ToolButton(
                             Icons.add_circle_outline,
                             'Add Atom',
-                            s.addAtom,
+                            _beginPlacement,
                           ),
                           const SizedBox(width: 6),
                           ToolButton(Icons.link, 'Add Bond', () {
-                            setState(() => connecting = !connecting);
+                            _setMode(
+                              interaction == InteractionMode.addBond
+                                  ? InteractionMode.select
+                                  : InteractionMode.addBond,
+                            );
                           }, active: connecting),
                           const SizedBox(width: 6),
                           ToolButton(
                             Icons.delete_outline,
                             'Delete',
-                            s.selectedAtom == null ? null : s.removeSelected,
+                            s.selectedAtom == null ? null : _deleteAtom,
                           ),
                           const SizedBox(width: 6),
                           ToolButton(
@@ -484,7 +522,7 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                             () => message(
                               context,
                               'Electrostatic surface unavailable',
-                              'This structure has no bundled validated partial-charge calculation or electrostatic potential grid. A calculated surface cannot be shown.',
+                              'This structure has no validated partial charges or potential grid. No calculated surface is available. Open Visualization legend from Molecule workspace for supported identity colors and units.',
                             ),
                           ),
                           const SizedBox(width: 6),
@@ -585,7 +623,7 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
                   final points = LewisPainter.layout(m, size);
                   for (final atom in m.atoms) {
                     if ((points[atom.id]! - d.localPosition).distance < 20) {
-                      s.selectAtom(atom.id);
+                      _pickAtom(atom.id);
                       break;
                     }
                   }
@@ -625,6 +663,32 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
             ),
             PropertyRow('Coordination number', '${neighbors.length}'),
             PropertyRow('Local shape', localGeometry(atom, neighbors)),
+            SizedBox(
+              height: 110,
+              child: LayoutBuilder(
+                builder: (context, box) => CustomPaint(
+                  size: Size(box.maxWidth, 110),
+                  painter: ScenePainter(
+                    m.copy(
+                      atoms: [atom, ...neighbors],
+                      bonds: m.bonds
+                          .where((b) => b.a == atom.id || b.b == atom.id)
+                          .toList(),
+                    ),
+                    CameraState(),
+                    DisplayMode.ballAndStick,
+                    atom.id,
+                    true,
+                    0,
+                    false,
+                    atomLabels: {
+                      for (final a in [atom, ...neighbors])
+                        a.id: s.data.element(a.number).symbol,
+                    },
+                  ),
+                ),
+              ),
+            ),
             for (var i = 0; i < neighbors.length; i++)
               for (var j = i + 1; j < neighbors.length; j++)
                 PropertyRow(
@@ -709,122 +773,32 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
   }
 
   Future<void> _library(StudioStore s, {bool savedOnly = false}) async {
-    String query = '';
-    bool saved = savedOnly;
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
-      builder: (context) => StatefulBuilder(
-        builder: (context, update) => SafeArea(
-          child: SizedBox(
-            height: MediaQuery.sizeOf(context).height * .78,
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      const Expanded(
-                        child: Text(
-                          'Molecule Library',
-                          style: TextStyle(fontSize: 23, color: Colors.white),
-                        ),
-                      ),
-                      FilterChip(
-                        label: const Text('Saved'),
-                        selected: saved,
-                        onSelected: (v) => update(() => saved = v),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    decoration: const InputDecoration(
-                      hintText: 'Search molecules',
-                      prefixIcon: Icon(Icons.search),
-                    ),
-                    onChanged: (v) => update(() => query = v),
-                  ),
-                  const SizedBox(height: 10),
-                  Expanded(
-                    child: ListView(
-                      children: [
-                        if (saved && s.saved.isEmpty)
-                          const Padding(
-                            padding: EdgeInsets.all(24),
-                            child: Text(
-                              'No saved molecules yet. Save your work from the menu.',
-                            ),
-                          ),
-                        for (final m
-                            in (saved ? s.saved : s.data.presets).where(
-                              (m) => m.name.toLowerCase().contains(
-                                query.toLowerCase(),
-                              ),
-                            ))
-                          ListTile(
-                            leading: const Icon(
-                              Icons.hub_outlined,
-                              color: cyan,
-                            ),
-                            title: Text(m.name),
-                            subtitle: Text(
-                              '${s.data.formula(m)} · ${m.atoms.length} atoms',
-                            ),
-                            trailing: saved
-                                ? IconButton(
-                                    tooltip: 'Delete saved molecule',
-                                    icon: const Icon(Icons.delete_outline),
-                                    onPressed: () async {
-                                      await s.deleteSaved(m.id);
-                                      update(() {});
-                                    },
-                                  )
-                                : const Icon(Icons.chevron_right),
-                            onTap: () {
-                              s.edit(m);
-                              camera.reset();
-                              Navigator.pop(context);
-                            },
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
+      builder: (sheet) => StudioLibrary(
+        store: s,
+        savedOnly: savedOnly,
+        onOpen: (m) {
+          Navigator.pop(sheet);
+          if (m.id.startsWith('saved-')) {
+            s.open(m);
+            camera.reset();
+          } else {
+            _previewMolecule(m, s);
+          }
+        },
+        onPreview: (m) => _previewMolecule(m, s),
       ),
     );
   }
 
   Future<void> _rename(StudioStore s, {bool save = false}) async {
-    final controller = TextEditingController(text: s.molecule.name);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(save ? 'Save molecule' : 'Rename molecule'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 80,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              if (controller.text.trim().isNotEmpty) {
-                Navigator.pop(context, controller.text.trim());
-              }
-            },
-            child: Text(save ? 'Save' : 'Rename'),
-          ),
-        ],
-      ),
+    final result = await promptText(
+      context,
+      title: save ? 'Save molecule' : 'Rename molecule',
+      initial: s.molecule.name,
+      confirm: save ? 'Save' : 'Rename',
     );
     if (result != null) {
       if (save) {
@@ -841,14 +815,25 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
           }
         }
       } else {
-        s.edit(s.molecule.copy(name: result));
+        s.edit(s.molecule.copy(name: result), label: 'Rename molecule');
       }
     }
-    controller.dispose();
   }
 
   Future<void> _action(String action, StudioStore s) async {
     switch (action) {
+      case 'workspace':
+        _workspaceTools();
+      case 'history':
+        _showHistory();
+      case 'palette':
+        _elementPalette(s);
+      case 'bookmarks':
+        _cameraBookmarks();
+      case 'legend':
+        _showLegend();
+      case 'preferences':
+        showViewingPreferences(context, s.preferences);
       case 'save':
         await _rename(s, save: true);
       case 'rename':
@@ -877,48 +862,12 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
               DisplayMode.values[(mode.index + 1) % DisplayMode.values.length],
         );
       case 'export':
-        await _export(
-          const JsonEncoder.withIndent('  ').convert(s.molecule.toJson()),
-          'Chemistry Universe JSON',
-        );
+        await _guidedExport(s);
       case 'mol':
-        await _export(_mol(s), 'MOL V2000');
+        await _guidedExport(s, initial: 'MOL');
       case 'import':
         await _import(s);
     }
-  }
-
-  Future<void> _export(String text, String title) async {
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(title),
-        content: SizedBox(
-          width: 600,
-          child: SingleChildScrollView(
-            child: SelectableText(
-              text,
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: text));
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Copied to clipboard')),
-              );
-            },
-            child: const Text('Copy'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
-    );
   }
 
   String _mol(StudioStore s) {
@@ -948,52 +897,13 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
     return out.toString();
   }
 
-  Future<void> _import(StudioStore s) async {
-    final controller = TextEditingController();
-    String? error;
-    await showDialog<void>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, update) => AlertDialog(
-          title: const Text('Import molecular JSON'),
-          content: SizedBox(
-            width: 500,
-            child: TextField(
-              controller: controller,
-              maxLines: 12,
-              decoration: InputDecoration(
-                hintText: 'Paste Chemistry Universe JSON',
-                errorText: error,
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () {
-                try {
-                  final value = jsonDecode(controller.text);
-                  if (value is! Map<String, dynamic>) {
-                    throw const FormatException('Expected a JSON object');
-                  }
-                  final m = Molecule.fromJson(value);
-                  s.edit(m);
-                  Navigator.pop(context);
-                } catch (e) {
-                  update(() => error = 'Invalid molecular data: $e');
-                }
-              },
-              child: const Text('Import'),
-            ),
-          ],
-        ),
-      ),
-    );
-    controller.dispose();
-  }
+  Future<void> _import(StudioStore s) => showDialog<void>(
+    context: context,
+    builder: (context) => MoleculeImportDialog(
+      data: s.data,
+      onImport: (m) => s.edit(m, label: 'Import ${m.name}'),
+    ),
+  );
 
   void _bondDetails(StudioStore s, Bond b) {
     showModalBottomSheet<void>(
@@ -1137,77 +1047,88 @@ class _MoleculeState extends ConsumerState<MoleculeScreen> {
     );
   }
 
-  void _optimize(StudioStore s) {
-    try {
-      final result = relaxBonds(s.molecule);
-      s.edit(result.molecule);
-      message(
-        context,
-        'Harmonic bond relaxation',
-        'Residual Σ(r − r₀)²: ${result.before.toStringAsFixed(6)} → ${result.after.toStringAsFixed(6)} Å².\n\nTargets use covalent-radius sums with bond-order scaling. This limited model minimizes bond-length residuals only. It omits angles, torsions, nonbonded interactions, and electronic energy. It is not a validated molecular mechanics optimizer.',
-      );
-    } catch (e) {
-      message(context, 'Relaxation unavailable', '$e');
-    }
-  }
-
   void _vibration() {
+    setState(() => vibrationVisible = true);
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
       builder: (context) => StatefulBuilder(
         builder: (context, update) => SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(22),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'Illustrative vibration',
-                  style: TextStyle(fontSize: 22, color: Colors.white),
-                ),
-                const Text(
-                  'Alternating atom displacements; not calculated normal modes. No frequency in cm⁻¹ is assigned.',
-                ),
-                SwitchListTile(
-                  title: const Text('Play'),
-                  value: vibration,
-                  onChanged: (v) {
-                    setState(() => vibration = v);
-                    update(() {});
-                  },
-                ),
-                Text('Amplitude ${amplitude.toStringAsFixed(2)} Å'),
-                Slider(
-                  value: amplitude,
-                  min: 0,
-                  max: .3,
-                  onChanged: (v) {
-                    setState(() => amplitude = v);
-                    update(() {});
-                  },
-                ),
-                Text('Speed ${speed.toStringAsFixed(1)}×'),
-                Slider(
-                  value: speed,
-                  min: .3,
-                  max: 3,
-                  onChanged: (v) {
-                    setState(() => speed = v);
-                    update(() {});
-                  },
-                ),
-                TextButton(
-                  onPressed: () {
-                    setState(() {
-                      amplitude = .1;
-                      speed = 1;
-                      vibration = false;
-                    });
-                    update(() {});
-                  },
-                  child: const Text('Reset'),
-                ),
-              ],
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(22),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'Illustrative vibration',
+                    style: TextStyle(fontSize: 22, color: Colors.white),
+                  ),
+                  const Text(
+                    'Illustrative displacements; not calculated normal modes. No frequency in cm⁻¹ is assigned. Measurements use the stored coordinates.',
+                  ),
+                  Wrap(
+                    spacing: 6,
+                    children: [
+                      for (final kind in ['Alternating', 'Radial breathing'])
+                        ChoiceChip(
+                          label: Text(kind),
+                          selected: vibrationKind == kind,
+                          onSelected: (_) {
+                            setState(() => vibrationKind = kind);
+                            update(() {});
+                          },
+                        ),
+                    ],
+                  ),
+                  SwitchListTile(
+                    title: const Text('Play'),
+                    value:
+                        vibration && !workspaceStore.preferences.reducedMotion,
+                    subtitle: workspaceStore.preferences.reducedMotion
+                        ? const Text('Playback is disabled by Reduce motion.')
+                        : null,
+                    onChanged: workspaceStore.preferences.reducedMotion
+                        ? null
+                        : (v) {
+                            setState(() => vibration = v);
+                            update(() {});
+                          },
+                  ),
+                  Text('Amplitude ${amplitude.toStringAsFixed(2)} Å'),
+                  Slider(
+                    value: amplitude,
+                    min: 0,
+                    max: .3,
+                    onChanged: (v) {
+                      setState(() => amplitude = v);
+                      update(() {});
+                    },
+                  ),
+                  Text('Speed ${speed.toStringAsFixed(1)}×'),
+                  Slider(
+                    value: speed,
+                    min: .3,
+                    max: 3,
+                    onChanged: (v) {
+                      setState(() => speed = v);
+                      update(() {});
+                    },
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        amplitude = .1;
+                        speed = 1;
+                        vibration = false;
+                        vibrationVisible = false;
+                      });
+                      update(() {});
+                    },
+                    child: const Text('Reset'),
+                  ),
+                ],
+              ),
             ),
           ),
         ),

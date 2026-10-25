@@ -7,6 +7,8 @@ import '../features/periodic_table.dart';
 import '../features/molecule_studio.dart';
 import '../rendering/molecule_view.dart';
 import 'design.dart';
+import '../shared/viewing_preferences.dart';
+import '../shared/draft_lifecycle.dart';
 
 final router = GoRouter(
   routes: [
@@ -16,15 +18,42 @@ final router = GoRouter(
   ],
 );
 
-class UniverseApp extends StatelessWidget {
+class UniverseApp extends ConsumerWidget {
   const UniverseApp({super.key});
   @override
-  Widget build(BuildContext context) => MaterialApp.router(
-    title: 'Chemistry Universe',
-    debugShowCheckedModeBanner: false,
-    theme: universeTheme(),
-    routerConfig: router,
-  );
+  Widget build(BuildContext context, WidgetRef ref) {
+    final prefs = ref.watch(studioProvider).preferences;
+    return ListenableBuilder(
+      listenable: prefs,
+      builder: (context, _) => StudioAppearance(
+        preferences: prefs,
+        child: MaterialApp.router(
+          title: 'Chemistry Universe',
+          debugShowCheckedModeBanner: false,
+          theme: universeTheme(),
+          routerConfig: router,
+          builder: (context, child) {
+            final media = MediaQuery.of(context);
+            return MediaQuery(
+              data: media.copyWith(
+                textScaler: TextScaler.linear(
+                  prefs.textScale > media.textScaler.scale(1)
+                      ? prefs.textScale
+                      : media.textScaler.scale(1),
+                ),
+                disableAnimations:
+                    prefs.reducedMotion || media.disableAnimations,
+              ),
+              child: DraftLifecycle(
+                store: ref.read(studioProvider),
+                child: child!,
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
 }
 
 const studios = [

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../shared/viewing_preferences.dart';
+
 const background = Color(0xff020d1c),
     panel = Color(0xff071b32),
     line = Color(0xff173a59),
@@ -87,7 +89,14 @@ class Panel extends StatelessWidget {
       borderRadius: BorderRadius.circular(16),
       border: Border.all(color: active ? cyan : line),
       boxShadow: active
-          ? [BoxShadow(color: cyan.withValues(alpha: .12), blurRadius: 14)]
+          ? [
+              BoxShadow(
+                color: cyan.withValues(
+                  alpha: .12 * (StudioAppearance.of(context)?.glow ?? 1),
+                ),
+                blurRadius: 14,
+              ),
+            ]
           : null,
     ),
     child: child,

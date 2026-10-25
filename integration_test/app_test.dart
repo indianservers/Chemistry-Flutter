@@ -28,6 +28,32 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(PeriodicScreen), findsOneWidget);
     await shot('02-periodic-table');
+    final periodicViewer = find.byKey(const ValueKey('periodic-viewport'));
+    final periodicCamera = tester
+        .widget<InteractiveViewer>(periodicViewer)
+        .transformationController!;
+    await tester.tap(find.byTooltip('Zoom in'));
+    await tester.pumpAndSettle();
+    expect(periodicCamera.value.getMaxScaleOnAxis(), greaterThan(1));
+    await tester.tap(find.byTooltip('Zoom out'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Pan controls'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Move left'));
+    await tester.pumpAndSettle();
+    expect(periodicCamera.value.storage[12], lessThan(0));
+    await shot('11-table-pan-controls');
+    await tester.tap(find.byTooltip('Pan controls'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Fit all elements'));
+    await tester.pumpAndSettle();
+    expect(periodicCamera.value.getMaxScaleOnAxis(), lessThan(1));
+    await shot('12-table-fit-all');
+    await tester.tap(find.byTooltip('Focus selected element'));
+    await tester.pumpAndSettle();
+    await shot('13-table-focus-carbon');
+    await tester.tap(find.byTooltip('Reset table view'));
+    await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Search elements'));
     await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField), 'Carbon');
@@ -61,11 +87,15 @@ void main() {
     expect(find.byType(MoleculeScreen), findsOneWidget);
     await shot('05-ethanol');
     final view = find.byType(MoleculeView);
+    await tester.ensureVisible(find.text('Rotate').first);
+    await tester.tap(find.text('Rotate').first);
+    await tester.pumpAndSettle();
     final initial = tester.widget<MoleculeView>(view).camera.yaw;
     await binding.watchPerformance(() async {
-      await tester.timedDrag(
-        view,
-        const Offset(70, 25),
+      await tester.timedDragFrom(
+        tester.getBottomLeft(view) +
+            Offset(tester.getSize(view).width * .55, -20),
+        const Offset(60, -10),
         const Duration(milliseconds: 800),
       );
       await tester.pumpAndSettle();
@@ -74,8 +104,12 @@ void main() {
     expect(tester.widget<MoleculeView>(view).camera.yaw, isNot(initial));
     await tester.tap(find.text('Add Atom'));
     await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Confirm placement'));
+    await tester.pumpAndSettle();
     await shot('06-editing');
     await tester.tap(find.byTooltip('Undo'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('molecule-inspector-handle')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Properties'));
     await tester.pumpAndSettle();

@@ -17,6 +17,17 @@ class ElementData {
   int get column => data['xpos'] as int;
   int get row => data['ypos'] as int;
   String get configuration => data['electron_configuration_semantic'] as String;
+  String valueQuality(String key) {
+    if (property(key) == null) {
+      return 'Unavailable';
+    }
+    return switch ((data['property_quality'] as Map?)?[key]) {
+      'measured' => 'Measured',
+      'estimated' => 'Estimated',
+      _ => 'Reference · uncertainty unspecified',
+    };
+  }
+
   double? property(String key) {
     if (key.startsWith('ionic:')) {
       final charge = int.parse(key.split(':')[1]);
@@ -362,7 +373,10 @@ List<String> validate(Molecule m) {
 }
 
 /// Limited harmonic bond relaxation. Not a force field or conformer prediction.
-({Molecule molecule, double before, double after}) relaxBonds(Molecule m) {
+({Molecule molecule, double before, double after}) relaxBonds(
+  Molecule m, {
+  int iterations = 150,
+}) {
   const radii = {
     1: .31,
     6: .76,
@@ -393,7 +407,7 @@ List<String> validate(Molecule m) {
       n.bonds.fold(0, (v, b) => v + math.pow(bondLength(n, b) - target(b), 2));
   var current = m;
   final before = energy(m);
-  for (var step = 0; step < 150; step++) {
+  for (var step = 0; step < iterations; step++) {
     final forces = {for (final a in current.atoms) a.id: Vector3.zero()};
     for (final b in current.bonds) {
       final d = current.atom(b.b).position - current.atom(b.a).position;
@@ -411,4 +425,35 @@ List<String> validate(Molecule m) {
     );
   }
   return (molecule: current, before: before, after: energy(current));
+}
+
+Future<({Molecule molecule, double before, double after})>
+relaxBondsCancellable(
+  Molecule original, {
+  required bool Function() cancelled,
+  required void Function(double) progress,
+}) async {
+  var current = original;
+  double before = 0, after = 0;
+  for (var i = 0; i < 15; i++) {
+    if (cancelled()) {
+      throw const FormatException(
+        'Calculation cancelled; original coordinates retained.',
+      );
+    }
+    final result = relaxBonds(current, iterations: 10);
+    if (i == 0) {
+      before = result.before;
+    }
+    after = result.after;
+    current = result.molecule;
+    progress((i + 1) / 15);
+    await Future<void>.delayed(Duration.zero);
+  }
+  if (cancelled()) {
+    throw const FormatException(
+      'Calculation cancelled; original coordinates retained.',
+    );
+  }
+  return (molecule: current, before: before, after: after);
 }

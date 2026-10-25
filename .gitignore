@@ -49,3 +49,4 @@ app.*.map.json
 
 /tool/mendeleev.db
 /tool/__pycache__/
+/android/.kotlin/

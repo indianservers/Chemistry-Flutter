@@ -5,7 +5,7 @@
 - `flutter pub get`: passed with Flutter 3.47.8 stable / Dart 3.13.7.
 - `dart format lib test integration_test test_driver`: passed.
 - `flutter analyze`: no issues (see `analyze.log`).
-- `flutter test`: 20 tests passed (see `tests.log`).
+- `flutter test`: 22 tests passed (see `tests.log`).
 - Android integration workflow: passed on `emulator-5554`, Android 17 / API 37, x86_64, 720×1280 screenshot surface. Wi-Fi and cellular data were disabled for the test and restored afterward. See `android-integration.log`.
 - Android debug APK: built successfully; the normal `lib/main.dart` entry point is used for the delivery build, not the integration-test harness. See `android-build.log` and `build/app/outputs/flutter-apk/app-debug.apk`.
 - Flutter Web: updated release build passed (see `web-build.log`); mobile remains the primary target.
@@ -48,7 +48,18 @@ This short debug-emulator sample is not evidence of sustained 60 FPS on physical
 
 `flutter doctor -v` found Flutter and the running Android emulator. Android SDK command-line tools were missing, and Windows desktop C++ components were incomplete; installed SDK build tools were sufficient for the APK. Flutter/Dart are installed at `C:\tools\flutter` but are not on PATH. Java's initial Windows loopback failure was resolved with process-local `TEMP`, `TMP`, `java.io.tmpdir` and `jdk.net.unixdomain.tmpdir` pointing to `C:\tmp`; see `tool/build_android.ps1`.
 
-## Phase 1 acceptance
+## Neon UI update
+
+The Periodic Table was restyled against `Taret UI/Periodic-Glow-Reference.png`. New tests assert real camera scale/translation changes for zoom, directional movement, fit, focus and reset; gesture locking; and touch dragging. All 22 tests and analysis pass. The updated Android integration run also exercises the viewport controls and captures 13 screens in `screenshots/neon-final/`, including directional movement, all 118 elements fitted into view and focus on Carbon. See `neon-android-integration.log`. The earlier offline run remains the baseline offline validation; this UI verification run used the emulator's normal connectivity.
+
+## 60 UI/UX enhancement update
+
+The implementation inventory is in `UX_ENHANCEMENTS.md`. Final analysis reports no issues, and all 36 unit/widget tests pass (`analyze.log`, `tests.log`). New coverage includes placement cancellation/confirmation, constrained movement with undo, bond previews, category filters, import review, local persistence/recovery, named history, measurements, confidence metadata and 320×640 layouts with larger text.
+
+The Android enhancement workflow passed (`enhancements-android.log`) and captured eight screens in `screenshots/enhancements/`. These exercise minimap/favorites, confirmed handoff, placement, constrained movement, pinned measurements, history, camera bookmarks, preset previews, viewing preferences and restored workspace. The original Android workflow also passed (`final-android-regression.log`), checking table controls, rotation, confirmed editing, geometry, save/load and navigation. Regression testing found and resolved a transient inspector expansion overflow. Screenshots were visually reviewed for controls, selection and overlays.
+
+Local draft recovery uses shared preferences; it is not durable file archival. Quality labels show measured/estimated only when explicit metadata exists, otherwise reference uncertainty is unspecified. The broader scientific acceptance limitations below remain unchanged.
+
+## Outstanding scientific acceptance requirements
 
 The full master brief is **not fully accepted**. A validated force-field optimizer, calculated electrostatic surfaces, full aromatic/stereochemical handling, true 3D quantum atom rendering and further scientific/device validation remain outstanding. The limited bond relaxer, unavailable electrostatic data and illustrative vibrations are labeled accurately in the app. See the README's remaining Phase 1 list.
-

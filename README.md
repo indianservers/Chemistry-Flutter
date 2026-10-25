@@ -28,6 +28,8 @@ If Java reports `Unable to establish loopback connection` on this Windows host, 
 
 ## Working features
 
+The Periodic Table now follows the supplied neon reference with an atom logo, midnight-blue scientific backdrop, glowing category chips and navigation, shaded element tiles with names, and a draggable element inspector. Pinch/drag and double-tap work alongside visible zoom in/out, zoom percentage, fit-all, focus-selected, reset, gesture lock and an optional directional pan pad. Group/period labels can be tapped to highlight them. The table options menu includes name visibility, trends, comparisons and isotope access. Updated Android captures are in `docs/screenshots/neon-final/`.
+
 The periodic table includes all 118 elements in their table positions, both detached series, search, selection persistence, category filtering, group/period highlights, details, isotope selection, schematic atom views, property heatmaps and numerical/bar comparisons. The entire table can be reached by pan/zoom without shrinking all 18 columns into unreadable tiles. Use Atom transfers the selected element into the molecular palette.
 
 The molecular workspace loads twenty offline presets: hydrogen, water, oxygen, nitrogen, methane, ethane, ethene, ethyne, ethanol, methanol, benzene, carbon dioxide, ammonia, acetic acid, acetone, glucose, glycerol, lactic acid, caffeine and aspirin. Molecular graphs remain editable. Supported controls include atom addition/replacement/deletion, charges and coordinates, connecting atoms, bond-order changes/removal, undo/redo, display modes, labels, camera rotation/pan/zoom/reset, geometry measurements and local shape labels. The inspector expands without resetting the camera or graph.
@@ -50,6 +52,8 @@ Direct runtime packages resolved in `pubspec.lock`:
 Development dependencies include Flutter test/driver/integration SDKs, Flutter lints and the preferences platform test implementation. Package licenses are also available through Flutter's license registry. Element data is CC BY-SA 3.0; Mendeleev data is MIT. See `assets/datasets/` and the provenance document.
 
 ## Validation
+
+The 60 UI/UX enhancements are described in [the implementation inventory](docs/UX_ENHANCEMENTS.md). Both studios now include persistent workspace settings, accessible viewing preferences, navigation aids and richer selection/editing controls. The Periodic Table retains the navy/cyan glow design, with pan, zoom, minimap and inspector controls. Molecule Studio adds explicit interaction modes, confirmed previews, named history, local recovery and guided import/export.
 
 See [validation notes](docs/VALIDATION.md), machine logs in `docs/`, and the screenshots directory. Windows cannot verify an iOS build; the generated iOS target is present but needs macOS/Xcode/device testing.
 
